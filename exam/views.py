@@ -14,6 +14,36 @@ import random
 import json
 from django.contrib.auth import logout
 from django.db.models import Case, When, IntegerField
+from .mixins import StudentRequiredMixin
+from django.db import models
+
+from exam.forms import ExamForm
+from .models import (
+    Exam, Question, QuestionChoice, AnswerKey, CorrectAnswer, 
+    ExamSubmission, StudentAnswer
+)
+
+User = get_user_model()
+
+
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth.mixins import LoginRequiredMixin, UserPassesTestMixin
+from django.views.generic import ListView, CreateView, DetailView, UpdateView, TemplateView
+from django.views import View
+from django.contrib import messages
+from django.db.models import Count, Q, F, Avg, Sum
+from django.utils import timezone
+from django.urls import reverse_lazy, reverse
+from django.db import transaction
+from django.contrib.auth import get_user_model
+from django import forms
+from django.http import JsonResponse, HttpResponse
+import random
+import json
+from django.contrib.auth import logout
+from django.db.models import Case, When, IntegerField
+from .mixins import StudentRequiredMixin
+from django.db import models
 
 from exam.forms import ExamForm
 from .models import (
@@ -132,67 +162,43 @@ class TeacherDashboardView(LoginRequiredMixin, ListView):
 
         return context
 
-class StudentDashboardView(LoginRequiredMixin, ListView):
+class StudentDashboardView(LoginRequiredMixin, StudentRequiredMixin, ListView):
     model = Exam
     template_name = 'exam/student_dashboard.html'
-    context_object_name = 'exams'
-    paginate_by = 12
+    context_object_name = 'exams_with_status'
+    paginate_by = 9
     
     def get_queryset(self):
         user = self.request.user
-        now = timezone.localtime()
-
-        base_queryset = Exam.objects.filter(
-            Q(access_type='all_students') |
-            Q(access_type='specific_students', allowed_students=user),
-            is_active=True
-        )
-
-        queryset = base_queryset.annotate(
-            priority=Case(
-                When(start_date_time__lte=now, end_date_time__gte=now, then=1),  # Active
-                When(start_date_time__gt=now, then=2),  # Upcoming
-                When(end_date_time__lt=now, then=3),  # Expired
-                default=3,
-                output_field=IntegerField()
-            )
-        ).order_by('priority', 'start_date_time')
-
-        return queryset
+        assigned_exams = Exam.objects.filter(
+            models.Q(access_type='all_students') | models.Q(allowed_students=user)
+        ).distinct()
+        return assigned_exams
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         user = self.request.user
-        now = timezone.localtime()
 
-        base_queryset = Exam.objects.filter(
-            Q(access_type='all_students') |
-            Q(access_type='specific_students', allowed_students=user),
-            is_active=True
-        )
-
-        # Stats
-        context['available_exams'] = base_queryset.filter(
-            start_date_time__lte=now, end_date_time__gte=now
-        ).count()
-        context['upcoming_exams'] = base_queryset.filter(
-            start_date_time__gt=now
-        ).count()
-        context['total_exams'] = base_queryset.count()
-
-        # Add status for each exam
+        exams_page = context['page_obj']
+        
         exams_with_status = []
-        for exam in context['exams']:
+        for exam in exams_page.object_list:
             status = exam.get_status_for_student(user)
+            attempts_made = exam.get_student_attempts(user)
+            remaining_attempts = exam.get_remaining_attempts(user)
+
             exams_with_status.append({
                 'exam': exam,
                 'status': status,
-                'can_take_now': status == 'available',
-                'remaining_attempts': exam.get_remaining_attempts(user),
-                'attempts_made': exam.get_student_attempts(user)
+                'attempts_made': attempts_made,
+                'remaining_attempts': remaining_attempts,
             })
 
         context['exams_with_status'] = exams_with_status
+        context['total_exams'] = self.get_queryset().count()
+        context['available_exams'] = sum(1 for item in exams_with_status if item['status'] == 'available')
+        context['upcoming_exams'] = sum(1 for item in exams_with_status if item['status'] == 'upcoming')
+        
         return context
 
 
@@ -200,15 +206,11 @@ class ExamCreateView(LoginRequiredMixin, UserPassesTestMixin, CreateView):
     model = Exam
     form_class = ExamForm
     template_name = 'exam/create_exam.html'
-    # Allow only teachers to access this view
     def test_func(self):
-     return self.request.user.is_authenticated and self.request.user.is_teacher
-
-
+        return self.request.user.is_authenticated and self.request.user.is_teacher
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        # Add student count information for better user experience
         total_students = User.objects.filter(user_type='student').count()
         context['total_students'] = total_students
         
@@ -292,11 +294,9 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
 
         try:
             with transaction.atomic():
-                # Get the next question order
                 last_question = self.exam.questions.order_by('-order').first()
                 next_order = (last_question.order + 1) if last_question else 1
 
-                # Create question
                 question = Question.objects.create(
                     exam=self.exam,
                     question_text=question_text,
@@ -304,7 +304,6 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
                     order=next_order
                 )
 
-                # Create choices
                 choice_labels = ['A', 'B', 'C', 'D']
                 created_choices = []
                 for i, choice_text in enumerate(choices):
@@ -316,13 +315,11 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
                     )
                     created_choices.append(choice)
 
-                # Create or update answer key
                 answer_key, created = AnswerKey.objects.get_or_create(
                     exam=self.exam,
                     defaults={'created_by': request.user}
                 )
 
-                # Find the correct choice and create correct answer
                 correct_choice = next(choice for choice in created_choices if choice.choice_label == correct_answer)
                 CorrectAnswer.objects.create(
                     answer_key=answer_key,
@@ -344,7 +341,6 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
             question_order = question.order
             question.delete()
             
-            # Reorder remaining questions
             remaining_questions = self.exam.questions.filter(order__gt=question_order).order_by('order')
             for i, q in enumerate(remaining_questions):
                 q.order = question_order + i
@@ -367,7 +363,6 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
                     defaults={'created_by': request.user}
                 )
 
-                # Update all correct answers
                 for question in self.exam.questions.all():
                     correct_choice_id = request.POST.get(f'question_{question.id}_answer')
                     
@@ -378,7 +373,6 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
                                 question=question
                             )
                             
-                            # Check if this is actually a change
                             existing_answer = CorrectAnswer.objects.filter(
                                 answer_key=answer_key,
                                 question=question
@@ -387,7 +381,6 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
                             if not existing_answer or existing_answer.correct_choice_id != int(correct_choice_id):
                                 changes_made = True
                             
-                            # Update or create correct answer
                             CorrectAnswer.objects.update_or_create(
                                 answer_key=answer_key,
                                 question=question,
@@ -424,13 +417,11 @@ class ExamDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
         context = super().get_context_data(**kwargs)
         exam = self.object
         
-        # Get all students who can access this exam
         if exam.access_type == 'all_students':
             eligible_students = User.objects.filter(user_type='student')
         else:
             eligible_students = exam.allowed_students.all()
         
-        # Get submission data for each student
         student_data = []
         for student in eligible_students:
             try:
@@ -455,16 +446,13 @@ class ExamDetailView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
                 'submitted_at': submitted_at,
             })
         
-        # Sort by status (completed first, then by name)
         student_data.sort(key=lambda x: (x['status'] != 'Completed', x['student'].get_full_name()))
         
-        # Calculate statistics
         total_students = len(student_data)
         completed_submissions = len([s for s in student_data if s['status'] == 'Completed'])
         in_progress = len([s for s in student_data if s['status'] == 'In Progress'])
         not_started = len([s for s in student_data if s['status'] == 'Not Started'])
         
-        # Calculate average score for completed submissions
         completed_submissions_objects = ExamSubmission.objects.filter(
             exam=exam, 
             is_completed=True
@@ -501,7 +489,6 @@ class ExamUpdateView(LoginRequiredMixin, UserPassesTestMixin, UpdateView):
     
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        # Add student count information for better user experience
         total_students = User.objects.filter(user_type='student').count()
         context['total_students'] = total_students
         
@@ -533,7 +520,6 @@ class ExamUpdateView(LoginRequiredMixin, UserPassesTestMixin, UpdateView):
         return reverse('exam:exam_detail', kwargs={'pk': self.object.pk})
 
 
-
 class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
     model = Exam
     template_name = 'exam/student_exam.html'
@@ -544,31 +530,27 @@ class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
 
     def dispatch(self, request, *args, **kwargs):
         """
-        Enforce allowed students, exam active/time window, and remaining attempts.
-        Prevents direct-URL bypass.
+        Enforce access restrictions on the detailed exam page.
+        This prevents direct URL bypass of the dashboard logic.
         """
-        exam = get_object_or_404(Exam, pk=kwargs.get('pk'))
-        user = request.user
-        now = timezone.localtime()
-        try:
-            start = timezone.localtime(exam.start_date_time)
-            end = timezone.localtime(exam.end_date_time)
-        except Exception:
-            start = exam.start_date_time
-            end = exam.end_date_time
+        exam = self.get_object()
+        user = self.request.user
+        
+        status = exam.get_status_for_student(user)
 
-        if exam.access_type == 'specific_students' and user not in exam.allowed_students.all():
-            messages.error(request, 'Access denied. You are not allowed to take this exam.')
-            return redirect('exam:dashboard')
-
-        if (not exam.is_active) or (start and now < start) or (end and now > end):
-            messages.error(request, 'Exam is not available at this time.')
-            return redirect('exam:dashboard')
-
-        if not exam.can_student_attempt(user):
-            messages.error(request, 'No attempts available for this exam.')
-            return redirect('exam:dashboard')
-
+        if status == 'upcoming':
+            messages.warning(request, 'This exam is not yet available. Please check back later.')
+            return redirect('exam:student_dashboard')
+        elif status == 'expired':
+            messages.error(request, 'This exam has expired.')
+            return redirect('exam:student_dashboard')
+        elif status == 'no_attempts':
+            messages.error(request, 'You have no remaining attempts for this exam.')
+            return redirect('exam:student_dashboard')
+        elif status == 'no_access':
+            messages.error(request, 'You do not have permission to access this exam.')
+            return redirect('exam:student_dashboard')
+        
         return super().dispatch(request, *args, **kwargs)
     
     def get_context_data(self, **kwargs):
@@ -576,12 +558,10 @@ class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
         exam = self.get_object()
         student = self.request.user
         
-        # Get attempt information
         context['attempts_made'] = exam.get_student_attempts(student)
         context['remaining_attempts'] = exam.get_remaining_attempts(student)
         context['max_attempts'] = exam.max_attempts
         
-        # Check for ongoing submission
         ongoing_submission = exam.submissions.filter(
             student=student, 
             is_completed=False
@@ -591,7 +571,6 @@ class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
             context['ongoing_submission'] = ongoing_submission
             context['time_remaining'] = ongoing_submission.get_time_remaining()
         
-        # Get completed submissions for this student
         completed_submissions = exam.submissions.filter(
             student=student,
             is_completed=True
@@ -606,7 +585,7 @@ class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
 
 
 class StartExamView(LoginRequiredMixin, UserPassesTestMixin, View):
-    """View to start a new exam attempt"""
+    """View to start or resume a new exam attempt."""
     
     def test_func(self):
         return self.request.user.is_student
@@ -615,52 +594,60 @@ class StartExamView(LoginRequiredMixin, UserPassesTestMixin, View):
         exam = get_object_or_404(Exam, pk=pk)
         student = request.user
         
-        # Validate availability and attempts before creating a submission
-        now = timezone.localtime()
-        try:
-            start = timezone.localtime(exam.start_date_time)
-            end = timezone.localtime(exam.end_date_time)
-        except Exception:
-            start = exam.start_date_time
-            end = exam.end_date_time
-
-        if exam.access_type == 'specific_students' and student not in exam.allowed_students.all():
-            messages.error(request, 'Access denied. You are not allowed to take this exam.')
-            return redirect('exam:student_exam', pk=pk)
-
-        if (not exam.is_active) or (start and now < start) or (end and now > end):
-            messages.error(request, 'Exam is not available at this time.')
-            return redirect('exam:student_exam', pk=pk)
-
-        if not exam.can_student_attempt(student):
-            messages.error(request, 'No attempts available for this exam.')
-            return redirect('exam:student_exam', pk=pk)
+        status = exam.get_status_for_student(student)
         
-        # Create new submission
-        try:
-            with transaction.atomic():
-                # Generate randomized question order
-                questions = list(exam.questions.values_list('id', flat=True))
-                random.shuffle(questions)
-                
-                submission = ExamSubmission.objects.create(
-                    exam=exam,
-                    student=student,
-                    total_marks=exam.total_marks,
-                    question_order=questions
-                )
-                
-                messages.success(request, f'Exam started! You have {exam.duration_minutes} minutes to complete.')
+        # Case 1: Exam is unavailable for any reason
+        if status not in ['available', 'in_progress']:
+            if status == 'upcoming':
+                messages.warning(request, 'This exam is not yet available. Please check back later.')
+            elif status == 'expired':
+                messages.error(request, 'This exam has expired.')
+            elif status == 'no_attempts':
+                messages.error(request, 'You have no remaining attempts for this exam.')
+            elif status == 'no_access':
+                messages.error(request, 'You do not have permission to access this exam.')
+            
+            return redirect('exam:student_dashboard')
+
+        # Case 2: Exam is available to start a new attempt
+        if status == 'available':
+            try:
+                with transaction.atomic():
+                    questions = list(exam.questions.values_list('id', flat=True))
+                    random.shuffle(questions)
+                    
+                    submission = ExamSubmission.objects.create(
+                        exam=exam,
+                        student=student,
+                        total_marks=exam.total_marks,
+                        question_order=questions
+                    )
+                    
+                    messages.success(request, f'Exam started! You have {exam.duration_minutes} minutes to complete.')
+                    return redirect('exam:take_exam', submission_id=submission.id)
+            except Exception as e:
+                messages.error(request, f'Failed to start exam. Error: {e}')
+                return redirect('exam:student_dashboard')
+
+        # Case 3: Exam is in progress, so we need to resume the existing attempt
+        elif status == 'in_progress':
+            submission = ExamSubmission.objects.filter(
+                exam=exam,
+                student=student,
+                is_completed=False
+            ).first()
+            
+            if submission:
+                messages.info(request, 'You have an ongoing attempt. Resuming exam.')
                 return redirect('exam:take_exam', submission_id=submission.id)
-                
-        except Exception as e:
-            messages.error(request, 'Failed to start exam. Please try again.')
-            return redirect('exam:student_exam', pk=pk)
+            else:
+                # Fallback in case of a data discrepancy
+                messages.error(request, 'Could not find ongoing submission.')
+                return redirect('exam:student_dashboard')
     
     def handle_no_permission(self):
         messages.error(self.request, 'Access denied. Students only.')
         return redirect('exam:dashboard')
-
 
 class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
     """View for student to take the exam"""
@@ -680,11 +667,9 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
     def get(self, request, submission_id):
         submission = self.get_submission(submission_id)
         
-        # Check if time is up
         if submission.is_time_up():
             return self.auto_submit_exam(submission)
         
-        # Get questions in randomized order
         question_ids = submission.question_order
         questions = []
         
@@ -695,7 +680,6 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
             except Question.DoesNotExist:
                 continue
         
-        # Get existing answers
         existing_answers = {}
         for answer in submission.answers.all():
             existing_answers[answer.question.id] = answer.selected_choice.id if answer.selected_choice else None
@@ -714,7 +698,6 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
     def post(self, request, submission_id):
         submission = self.get_submission(submission_id)
         
-        # Check if time is up
         if submission.is_time_up():
             return self.auto_submit_exam(submission)
         
@@ -738,7 +721,6 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
             question = Question.objects.get(id=question_id, exam=submission.exam)
             choice = QuestionChoice.objects.get(id=choice_id, question=question) if choice_id else None
             
-            # Update or create answer
             answer, created = StudentAnswer.objects.update_or_create(
                 submission=submission,
                 question=question,
@@ -752,14 +734,12 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
     
     def submit_exam(self, request, submission):
         """Submit the exam"""
-        print(f"DEBUG: submit_exam called for submission {submission.id}")  # Debug line
         try:
             with transaction.atomic():
                 submission.submitted_at = timezone.now()
                 submission.is_completed = True
                 submission.time_taken = submission.submitted_at - submission.started_at
                 
-                # Calculate score and total marks
                 score = 0
                 total_marks = submission.exam.questions.aggregate(
                     total=Sum('marks')
@@ -771,15 +751,13 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
                 
                 submission.score = score
                 submission.total_marks = total_marks
-                submission.calculate_percentage()  # This will calculate percentage
+                submission.calculate_percentage()
                 submission.save()
                 
-                print(f"DEBUG: Exam submitted successfully. Score: {score}/{submission.total_marks}")  # Debug line
                 messages.success(request, f'Exam submitted successfully! Your score: {score}/{submission.total_marks}')
                 return redirect('exam:exam_result', submission_id=submission.id)
                 
         except Exception as e:
-            print(f"DEBUG: Error submitting exam: {e}")  # Debug line
             messages.error(request, 'Failed to submit exam. Please try again.')
             return redirect('exam:take_exam', submission_id=submission.id)
     
@@ -793,7 +771,6 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
                     submission.auto_submitted = True
                     submission.time_taken = timezone.timedelta(minutes=submission.exam.duration_minutes)
                     
-                    # Calculate score and total marks
                     score = 0
                     total_marks = submission.exam.questions.aggregate(
                         total=Sum('marks')
@@ -805,7 +782,7 @@ class TakeExamView(LoginRequiredMixin, UserPassesTestMixin, View):
                     
                     submission.score = score
                     submission.total_marks = total_marks
-                    submission.calculate_percentage()  # This will calculate percentage
+                    submission.calculate_percentage()
                     submission.save()
                     
                     messages.warning(self.request, 'Time is up! Your exam has been automatically submitted.')
@@ -835,7 +812,6 @@ class ExamResultView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
         context = super().get_context_data(**kwargs)
         submission = self.get_object()
         
-        # Get all answers with correct/incorrect status
         answers_data = []
         for answer in submission.answers.all():
             try:
@@ -877,7 +853,6 @@ class StudentProfileView(LoginRequiredMixin, TemplateView):
         student = self.request.user
         context['student'] = student
 
-        # Get all exams the student can access
         accessible_exams = Exam.objects.filter(
             Q(access_type='all_students') |
             Q(allowed_students=student),
@@ -888,7 +863,6 @@ class StudentProfileView(LoginRequiredMixin, TemplateView):
         total_score = 0
         total_exams_taken = 0
 
-        # Prepare exam performance data
         for exam in accessible_exams:
             submission = ExamSubmission.objects.filter(exam=exam, student=student).first()
 
@@ -913,10 +887,8 @@ class StudentProfileView(LoginRequiredMixin, TemplateView):
                 'badge_class': badge_class,
             })
 
-        # Average score
         avg_score = round(total_score / total_exams_taken, 2) if total_exams_taken else 0
 
-        # Grade distribution (A, B, C, D, F)
         grade_ranges = {
             'A (90-100%)': 0,
             'B (80-89%)': 0,

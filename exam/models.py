@@ -15,6 +15,12 @@ from django.core.validators import MinValueValidator, MaxValueValidator
 from django.core.exceptions import ValidationError
 from django.utils import timezone
 
+from django.db import models
+from django.conf import settings
+from django.utils import timezone
+from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator, MaxValueValidator
+
 class Exam(models.Model):
     ACCESS_TYPE_CHOICES = [
         ('all_students', 'All Students'),
@@ -68,13 +74,13 @@ class Exam(models.Model):
 
     # ----------------- Status Methods -----------------
     def is_upcoming(self):
-        return timezone.localtime(timezone.now()) < self.start_date_time
+        return timezone.now() < self.start_date_time
 
     def is_expired(self):
-        return timezone.localtime(timezone.now()) > self.end_date_time
+        return timezone.now() > self.end_date_time
 
     def is_currently_active(self):
-        now = timezone.localtime(timezone.now())
+        now = timezone.now()
         return self.start_date_time <= now <= self.end_date_time
 
     @property
@@ -111,7 +117,7 @@ class Exam(models.Model):
 
     def get_status_for_student(self, student):
         """Get exam status specifically for a student."""
-        now = timezone.localtime(timezone.now())
+        now = timezone.now()
 
         if now < self.start_date_time:
             return 'upcoming'
@@ -133,6 +139,7 @@ class Exam(models.Model):
 
         return 'available'
 
+# --------------------------------------------------------------------------------------
 
 class Question(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='questions')
@@ -150,6 +157,7 @@ class Question(models.Model):
     def __str__(self):
         return f"Q{self.order}: {self.question_text[:50]}..."
 
+# --------------------------------------------------------------------------------------
 
 class QuestionChoice(models.Model):
     question = models.ForeignKey(Question, on_delete=models.CASCADE, related_name='choices')
@@ -166,6 +174,7 @@ class QuestionChoice(models.Model):
     def __str__(self):
         return f"{self.choice_label}. {self.choice_text}"
 
+# --------------------------------------------------------------------------------------
 
 class AnswerKey(models.Model):
     exam = models.OneToOneField(Exam, on_delete=models.CASCADE, related_name='answer_key')
@@ -184,6 +193,7 @@ class AnswerKey(models.Model):
     def __str__(self):
         return f"Answer Key for {self.exam.title}"
 
+# --------------------------------------------------------------------------------------
 
 class CorrectAnswer(models.Model):
     answer_key = models.ForeignKey(AnswerKey, on_delete=models.CASCADE, related_name='correct_answers')
@@ -203,6 +213,7 @@ class CorrectAnswer(models.Model):
     def __str__(self):
         return f"Answer for Q{self.question.order}: {self.correct_choice.choice_label}"
 
+# --------------------------------------------------------------------------------------
 
 class ExamAccess(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='access_records')
@@ -230,6 +241,7 @@ class ExamAccess(models.Model):
         status = "Revoked" if self.is_revoked else "Active"
         return f"{self.student.get_full_name()} - {self.exam.title} ({status})"
 
+# --------------------------------------------------------------------------------------
 
 class ExamSubmission(models.Model):
     exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='submissions')
@@ -311,6 +323,7 @@ class ExamSubmission(models.Model):
         self.calculate_percentage()
         super().save(*args, **kwargs)
 
+# --------------------------------------------------------------------------------------
 
 class StudentAnswer(models.Model):
     submission = models.ForeignKey(ExamSubmission, on_delete=models.CASCADE, related_name='answers')

@@ -38,4 +38,5 @@ urlpatterns = [
 
     path('debug-timezone/', views.debug_timezone_view, name='debug_timezone'),
     path('logout/', views.CustomLogoutView.as_view(), name='logout'),
+    path('exam/<int:pk>/start/', views.StartExamView.as_view(), name='start_exam'),
 ]

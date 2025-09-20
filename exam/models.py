@@ -3,7 +3,17 @@ from django.conf import settings
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from django.core.validators import MinValueValidator, MaxValueValidator
+from django.utils import timezone
+from django.utils import timezone
+timezone.localtime(timezone.now())
 
+
+
+from django.db import models
+from django.conf import settings
+from django.core.validators import MinValueValidator, MaxValueValidator
+from django.core.exceptions import ValidationError
+from django.utils import timezone
 
 class Exam(models.Model):
     ACCESS_TYPE_CHOICES = [
@@ -21,18 +31,11 @@ class Exam(models.Model):
     )
     start_date_time = models.DateTimeField()
     end_date_time = models.DateTimeField()
-    duration_minutes = models.PositiveIntegerField(
-        default=60,
-        help_text="Duration in minutes for how long students have to complete the exam"
-    )
-    max_attempts = models.PositiveIntegerField(
-        default=1,
-        help_text="Maximum number of attempts allowed per student"
-    )
+    duration_minutes = models.PositiveIntegerField(default=60)
+    max_attempts = models.PositiveIntegerField(default=1)
     passing_percentage = models.PositiveIntegerField(
         default=60,
-        validators=[MinValueValidator(1), MaxValueValidator(100)],
-        help_text="Minimum percentage required to pass this exam (1-100%)"
+        validators=[MinValueValidator(1), MaxValueValidator(100)]
     )
     access_type = models.CharField(
         max_length=20,
@@ -62,82 +65,72 @@ class Exam(models.Model):
         if self.start_date_time and self.end_date_time:
             if self.start_date_time >= self.end_date_time:
                 raise ValidationError('Start date must be before end date.')
-    
-    def is_active_now(self):
-        now = timezone.now()
-        return self.is_active and self.start_date_time <= now <= self.end_date_time
-    
+
+    # ----------------- Status Methods -----------------
     def is_upcoming(self):
-        return timezone.now() < self.start_date_time
-    
+        return timezone.localtime(timezone.now()) < self.start_date_time
+
     def is_expired(self):
-        return timezone.now() > self.end_date_time
-    
+        return timezone.localtime(timezone.now()) > self.end_date_time
+
+    def is_currently_active(self):
+        now = timezone.localtime(timezone.now())
+        return self.start_date_time <= now <= self.end_date_time
+
+    @property
+    def is_active_now(self):
+        return self.is_currently_active()
+
+    @property
+    def is_upcoming_now(self):
+        return self.is_upcoming()
+
     def can_student_access(self, student):
-        if self.access_type == 'all_students' and student.is_student:
+        if self.access_type == 'all_students' and student.user_type == 'student':
             return True
         return self.allowed_students.filter(id=student.id).exists()
-    
+
     def get_total_students(self):
-        """Calculate total number of students who can access this exam."""
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
         if self.access_type == 'all_students':
-            # Count all students in the system
-            from django.contrib.auth import get_user_model
-            User = get_user_model()
             return User.objects.filter(user_type='student').count()
-        else:
-            # Count specifically allowed students
-            return self.allowed_students.count()
-    
+        return self.allowed_students.count()
+
     def get_students_taken(self):
-        """Get count of students who have taken this exam."""
         return self.submissions.filter(is_completed=True).values('student').distinct().count()
-    
+
     def get_student_attempts(self, student):
-        """Get number of attempts a student has made for this exam."""
         return self.submissions.filter(student=student).count()
-    
+
     def can_student_attempt(self, student):
-        """Check if student can make another attempt."""
-        attempts_made = self.get_student_attempts(student)
-        return attempts_made < self.max_attempts
-    
+        return self.get_student_attempts(student) < self.max_attempts
+
     def get_remaining_attempts(self, student):
-        """Get number of remaining attempts for a student."""
-        attempts_made = self.get_student_attempts(student)
-        return max(0, self.max_attempts - attempts_made)
-    
+        return max(0, self.max_attempts - self.get_student_attempts(student))
+
     def get_status_for_student(self, student):
         """Get exam status specifically for a student."""
-        now = timezone.now()
-        
-        # Check if exam window is open
+        now = timezone.localtime(timezone.now())
+
         if now < self.start_date_time:
             return 'upcoming'
         elif now > self.end_date_time:
             return 'expired'
-        
-        # Check if student has access
+
         if not self.can_student_access(student):
             return 'no_access'
-        
-        # Check attempts
+
         if not self.can_student_attempt(student):
             return 'no_attempts'
-        
-        # Check if student has an ongoing submission
-        ongoing = self.submissions.filter(
-            student=student, 
-            is_completed=False
-        ).first()
-        
+
+        ongoing = self.submissions.filter(student=student, is_completed=False).first()
         if ongoing:
-            # Check if time is up for ongoing submission
             time_elapsed = now - ongoing.started_at
             if time_elapsed.total_seconds() > (self.duration_minutes * 60):
                 return 'time_up'
             return 'in_progress'
-        
+
         return 'available'
 
 

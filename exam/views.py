@@ -9,9 +9,11 @@ from django.urls import reverse_lazy, reverse
 from django.db import transaction
 from django.contrib.auth import get_user_model
 from django import forms
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponse
 import random
 import json
+from django.contrib.auth import logout
+from django.db.models import Case, When, IntegerField
 
 from exam.forms import ExamForm
 from .models import (
@@ -22,7 +24,23 @@ from .models import (
 User = get_user_model()
 
 
+def debug_timezone_view(request):
+    """
+    Simple debug view for quick diagnostics (uses localtime).
+    """
+    now = timezone.localtime()
+    tz = timezone.get_current_timezone_name()
+    return HttpResponse(f"Now: {now.isoformat()} (timezone: {tz})")
 
+
+class CustomLogoutView(View):
+    """Logout and redirect to custom signin (avoid falling back to /admin/login/)."""
+    def get(self, request, *args, **kwargs):
+        logout(request)
+        return redirect(reverse_lazy('authentication:signin'))
+    def post(self, request, *args, **kwargs):
+        logout(request)
+        return redirect(reverse_lazy('authentication:signin'))
 
 
 class DashboardView(LoginRequiredMixin, ListView):
@@ -48,12 +66,11 @@ class TeacherDashboardView(LoginRequiredMixin, ListView):
     template_name = 'exam/teacher_dashboard.html'
     context_object_name = 'exams'
     paginate_by = 12
-    
+
     def get_queryset(self):
-        from django.db.models import Case, When, IntegerField
-        
-        now = timezone.now()
-        
+        # use localtime so displayed statuses match local times
+        now = timezone.localtime()
+
         # Get all exams created by this teacher with priority ordering
         queryset = Exam.objects.filter(
             teacher=self.request.user
@@ -86,40 +103,34 @@ class TeacherDashboardView(LoginRequiredMixin, ListView):
                 output_field=IntegerField()
             )
         ).order_by('priority', 'start_date_time')
-        
+
         return queryset
-    
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context['user_role'] = 'Teacher'
-        
-        now = timezone.now()
-        queryset = Exam.objects.filter(teacher=self.request.user)
-        
-        context['total_exams'] = queryset.count()
-        
-        # Count exams by their actual status (not just is_active field)
-        context['active_exams'] = queryset.filter(
+
+        now = timezone.localtime()
+        exams = Exam.objects.filter(teacher=self.request.user)
+
+        context['total_exams'] = exams.count()
+        context['active_exams'] = exams.filter(
             is_active=True,
             start_date_time__lte=now,
             end_date_time__gte=now
         ).count()
-        
-        context['upcoming_exams'] = queryset.filter(
+        context['upcoming_exams'] = exams.filter(
             is_active=True,
             start_date_time__gt=now
         ).count()
-        
-        context['expired_exams'] = queryset.filter(
+        context['expired_exams'] = exams.filter(
             end_date_time__lt=now
         ).count()
-        
-        context['disabled_exams'] = queryset.filter(
+        context['disabled_exams'] = exams.filter(
             is_active=False
         ).count()
-        
-        return context
 
+        return context
 
 class StudentDashboardView(LoginRequiredMixin, ListView):
     model = Exam
@@ -128,90 +139,60 @@ class StudentDashboardView(LoginRequiredMixin, ListView):
     paginate_by = 12
     
     def get_queryset(self):
-        from django.db.models import Case, When, IntegerField
-        
         user = self.request.user
-        now = timezone.now()
-        
-        # Get all exams the student has access to
+        now = timezone.localtime()
+
         base_queryset = Exam.objects.filter(
             Q(access_type='all_students') |
             Q(access_type='specific_students', allowed_students=user),
             is_active=True
         )
-        
-        # Add priority ordering using Case/When
-        # Priority: 1 = Active (can take now), 2 = Upcoming, 3 = Expired
+
         queryset = base_queryset.annotate(
             priority=Case(
-                # Active exams (can take now) - Priority 1
-                When(
-                    start_date_time__lte=now,
-                    end_date_time__gte=now,
-                    then=1
-                ),
-                # Upcoming exams - Priority 2
-                When(
-                    start_date_time__gt=now,
-                    then=2
-                ),
-                # Expired exams - Priority 3
-                When(
-                    end_date_time__lt=now,
-                    then=3
-                ),
+                When(start_date_time__lte=now, end_date_time__gte=now, then=1),  # Active
+                When(start_date_time__gt=now, then=2),  # Upcoming
+                When(end_date_time__lt=now, then=3),  # Expired
                 default=3,
                 output_field=IntegerField()
             )
         ).order_by('priority', 'start_date_time')
-        
+
         return queryset
-    
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
-        context['user_role'] = 'Student'
-        
-        now = timezone.now()
         user = self.request.user
-        
-        # Get base queryset for stats (without annotation to avoid duplication)
+        now = timezone.localtime()
+
         base_queryset = Exam.objects.filter(
             Q(access_type='all_students') |
             Q(access_type='specific_students', allowed_students=user),
             is_active=True
         )
-        
-        # Calculate stats
+
+        # Stats
         context['available_exams'] = base_queryset.filter(
-            start_date_time__lte=now,
-            end_date_time__gte=now
+            start_date_time__lte=now, end_date_time__gte=now
         ).count()
-        
         context['upcoming_exams'] = base_queryset.filter(
             start_date_time__gt=now
         ).count()
-        
         context['total_exams'] = base_queryset.count()
-        
-        # Add exam status information for each exam in the current page
+
+        # Add status for each exam
         exams_with_status = []
         for exam in context['exams']:
-            exam_status = exam.get_status_for_student(user)
-            attempts_made = exam.get_student_attempts(user)
-            remaining_attempts = exam.get_remaining_attempts(user)
-            can_attempt = exam.can_student_attempt(user)
-            
+            status = exam.get_status_for_student(user)
             exams_with_status.append({
                 'exam': exam,
-                'status': exam_status,
-                'attempts_made': attempts_made,
-                'remaining_attempts': remaining_attempts,
-                'can_attempt': can_attempt,
-                'can_take_now': exam_status == 'available' and can_attempt,
+                'status': status,
+                'can_take_now': status == 'available',
+                'remaining_attempts': exam.get_remaining_attempts(user),
+                'attempts_made': exam.get_student_attempts(user)
             })
-        
+
         context['exams_with_status'] = exams_with_status
-        
         return context
 
 
@@ -219,6 +200,11 @@ class ExamCreateView(LoginRequiredMixin, UserPassesTestMixin, CreateView):
     model = Exam
     form_class = ExamForm
     template_name = 'exam/create_exam.html'
+    # Allow only teachers to access this view
+    def test_func(self):
+     return self.request.user.is_authenticated and self.request.user.is_teacher
+
+
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -271,11 +257,11 @@ class QuestionManagementView(LoginRequiredMixin, UserPassesTestMixin, View):
     def post(self, request, exam_id):
         action = request.POST.get('action')
         
-        if action == 'add_question':
+        if (action == 'add_question'):
             return self._add_question(request)
-        elif action == 'delete_question':
+        elif (action == 'delete_question'):
             return self._delete_question(request)
-        elif action == 'save_answers':
+        elif (action == 'save_answers'):
             return self._save_answer_key(request)
         
         return redirect('exam:manage_questions', exam_id=exam_id)
@@ -555,6 +541,35 @@ class StudentExamView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
     
     def test_func(self):
         return self.request.user.is_student
+
+    def dispatch(self, request, *args, **kwargs):
+        """
+        Enforce allowed students, exam active/time window, and remaining attempts.
+        Prevents direct-URL bypass.
+        """
+        exam = get_object_or_404(Exam, pk=kwargs.get('pk'))
+        user = request.user
+        now = timezone.localtime()
+        try:
+            start = timezone.localtime(exam.start_date_time)
+            end = timezone.localtime(exam.end_date_time)
+        except Exception:
+            start = exam.start_date_time
+            end = exam.end_date_time
+
+        if exam.access_type == 'specific_students' and user not in exam.allowed_students.all():
+            messages.error(request, 'Access denied. You are not allowed to take this exam.')
+            return redirect('exam:dashboard')
+
+        if (not exam.is_active) or (start and now < start) or (end and now > end):
+            messages.error(request, 'Exam is not available at this time.')
+            return redirect('exam:dashboard')
+
+        if not exam.can_student_attempt(user):
+            messages.error(request, 'No attempts available for this exam.')
+            return redirect('exam:dashboard')
+
+        return super().dispatch(request, *args, **kwargs)
     
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
@@ -599,6 +614,27 @@ class StartExamView(LoginRequiredMixin, UserPassesTestMixin, View):
     def post(self, request, pk):
         exam = get_object_or_404(Exam, pk=pk)
         student = request.user
+        
+        # Validate availability and attempts before creating a submission
+        now = timezone.localtime()
+        try:
+            start = timezone.localtime(exam.start_date_time)
+            end = timezone.localtime(exam.end_date_time)
+        except Exception:
+            start = exam.start_date_time
+            end = exam.end_date_time
+
+        if exam.access_type == 'specific_students' and student not in exam.allowed_students.all():
+            messages.error(request, 'Access denied. You are not allowed to take this exam.')
+            return redirect('exam:student_exam', pk=pk)
+
+        if (not exam.is_active) or (start and now < start) or (end and now > end):
+            messages.error(request, 'Exam is not available at this time.')
+            return redirect('exam:student_exam', pk=pk)
+
+        if not exam.can_student_attempt(student):
+            messages.error(request, 'No attempts available for this exam.')
+            return redirect('exam:student_exam', pk=pk)
         
         # Create new submission
         try:
@@ -831,3 +867,83 @@ class ExamResultView(LoginRequiredMixin, UserPassesTestMixin, DetailView):
     def handle_no_permission(self):
         messages.error(self.request, 'Access denied.')
         return redirect('exam:dashboard')
+
+
+class StudentProfileView(LoginRequiredMixin, TemplateView):
+    template_name = 'authentication/student_profile.html'
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        student = self.request.user
+        context['student'] = student
+
+        # Get all exams the student can access
+        accessible_exams = Exam.objects.filter(
+            Q(access_type='all_students') |
+            Q(allowed_students=student),
+            is_active=True
+        ).distinct()
+
+        exam_performance = []
+        total_score = 0
+        total_exams_taken = 0
+
+        # Prepare exam performance data
+        for exam in accessible_exams:
+            submission = ExamSubmission.objects.filter(exam=exam, student=student).first()
+
+            if submission:
+                total_exams_taken += 1
+                total_score += submission.percentage
+
+                if submission.percentage >= exam.passing_percentage:
+                    result_status = 'Passed'
+                    badge_class = 'bg-success'
+                else:
+                    result_status = 'Failed'
+                    badge_class = 'bg-danger'
+            else:
+                result_status = 'Not Taken'
+                badge_class = 'bg-secondary'
+
+            exam_performance.append({
+                'exam': exam,
+                'submission': submission,
+                'result_status': result_status,
+                'badge_class': badge_class,
+            })
+
+        # Average score
+        avg_score = round(total_score / total_exams_taken, 2) if total_exams_taken else 0
+
+        # Grade distribution (A, B, C, D, F)
+        grade_ranges = {
+            'A (90-100%)': 0,
+            'B (80-89%)': 0,
+            'C (70-79%)': 0,
+            'D (60-69%)': 0,
+            'F (<60%)': 0
+        }
+        for perf in exam_performance:
+            sub = perf['submission']
+            if sub:
+                perc = sub.percentage
+                if perc >= 90:
+                    grade_ranges['A (90-100%)'] += 1
+                elif perc >= 80:
+                    grade_ranges['B (80-89%)'] += 1
+                elif perc >= 70:
+                    grade_ranges['C (70-79%)'] += 1
+                elif perc >= 60:
+                    grade_ranges['D (60-69%)'] += 1
+                else:
+                    grade_ranges['F (<60%)'] += 1
+
+        context.update({
+            'exam_performance': exam_performance,
+            'avg_score': avg_score,
+            'total_exams_taken': total_exams_taken,
+            'grade_ranges': grade_ranges.items()
+        })
+
+        return context

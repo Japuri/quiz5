@@ -13,7 +13,7 @@ A comprehensive web-based examination system built with Django 5.2, designed for
 
 #### 1. Clone the Repository
 ```bash
-git clone https://github.com/zanra22/Quiz5.git
+git clone https://github.com/Japuri/quiz5.git
 cd Quiz5
 ```
 
